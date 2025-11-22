@@ -2,85 +2,64 @@ import streamlit as st
 import numpy as np
 import nibabel as nib
 import matplotlib.pyplot as plt
-import pickle
+import joblib
+from io import BytesIO
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
-import tempfile
 from skimage.feature import graycomatrix, graycoprops
+import tempfile
 
-# ---------------------- PAGE CONFIG ----------------------
-st.set_page_config(
-    page_title="AI Liver MRI Cirrhosis Screening",
-    layout="wide",
-    page_icon="🧬"
-)
 
-# ---------------------- CUSTOM UI THEME ----------------------
-custom_css = """
-<style>
-    body {
-        background: linear-gradient(135deg, #4e54c8, #8f94fb);
-        font-family: 'Inter', sans-serif;
-    }
-    .stApp {
-        background: rgba(255, 255, 255, 0.15);
-        backdrop-filter: blur(12px);
-        border-radius: 18px;
-        padding: 30px;
-        margin-top: 20px;
-    }
-    h1, h2, h3, h4, label {
-        color: white !important;
-    }
-    .stProgress > div > div > div > div {
-        background-color: #00eaff !important;
-    }
-    .stButton>button {
-        background: linear-gradient(90deg, #00F260, #0575E6);
-        color: white;
-        font-weight: 600;
-        border-radius: 10px;
-        padding: 12px 18px;
-        font-size: 16px;
-        border: none;
-        transition: 0.3s ease;
-    }
-    .stButton>button:hover {
-        transform: scale(1.05);
-        background: linear-gradient(90deg, #0575E6, #00F260);
-    }
-    .result-box {
-        background: rgba(255, 255, 255, 0.30);
-        backdrop-filter: blur(10px);
-        padding: 18px;
-        border-radius: 12px;
-        border: 1px solid rgba(255,255,255,0.4);
-        margin-top: 15px;
-    }
-</style>
-"""
-st.markdown(custom_css, unsafe_allow_html=True)
+# ---------------------- UI CONFIG ----------------------
+st.set_page_config(page_title="AI Liver MRI Cirrhosis Screening", page_icon="🧬", layout="centered")
 
-# ---------------------- HEADER ----------------------
+# ---------------------- THEME ----------------------
 st.markdown("""
-# 🏥 AI Liver MRI Cirrhosis Screening  
-Upload MRI scans and generate an AI-assisted medical summary.
+<style>
+body {
+    background: linear-gradient(135deg, #4e54c8, #8f94fb);
+}
+.stApp {
+    background: rgba(255, 255, 255, 0.15);
+    backdrop-filter: blur(12px);
+    border-radius: 18px;
+    padding: 20px;
+}
+label, h2, h3 {
+    color: white !important;
+    font-weight: 600;
+}
+.stButton>button {
+    background: linear-gradient(90deg, #00F260, #0575E6);
+    color: white;
+    font-weight: bold;
+    border-radius: 8px;
+    padding: 10px 20px;
+    transition: 0.3s;
+}
+.stButton>button:hover {
+    transform: scale(1.05);
+}
+.result-box {
+    background: rgba(255,255,255,0.3);
+    border-radius: 10px;
+    padding: 15px;
+    border-left: 6px solid white;
+    margin-top: 15px;
+}
+</style>
+""", unsafe_allow_html=True)
 
-> ⚠️ Research-use only — Not a substitute for clinical diagnosis.
-""")
 
-# ---------------------- LOAD MODEL ----------------------
-import joblib
-
-MODEL_PATH = "RandomForest_Cirrhosis.joblib"
+# ---------------------- MODEL LOADING ----------------------
+MODEL_PATH = "RandomForest_Cirrhosis.joblib"  # Must match GitHub file
 model = joblib.load(MODEL_PATH)
 
 
 # ---------------------- FEATURE EXTRACTION ----------------------
 def extract_features(slice_img):
     slice_img = (slice_img / np.max(slice_img) * 255).astype(np.uint8)
-    glcm = graycomatrix(slice_img, distances=[1], angles=[0], levels=256, symmetric=True, normed=True)
-    
+    glcm = graycomatrix(slice_img, distances=[1], angles=[0], symmetric=True, normed=True, levels=256)
     return [
         graycoprops(glcm, 'contrast')[0][0],
         graycoprops(glcm, 'homogeneity')[0][0],
@@ -88,120 +67,117 @@ def extract_features(slice_img):
         graycoprops(glcm, 'energy')[0][0]
     ]
 
-# ---------------------- USER INPUT FORM ----------------------
+
+# ---------------------- HEADER ----------------------
+st.title("🩺 AI Liver MRI Cirrhosis Screening")
+st.caption("⚠ Research-use only — Not a substitute for clinical diagnosis.")
+
+
+# ---------------------- FORM ----------------------
 with st.form("patient_form"):
-    st.subheader("📌 Patient Information")
-    patient_name = st.text_input("Patient Name")
-    patient_id = st.text_input("Patient ID")
-    age = st.number_input("Age", min_value=1, max_value=120, step=1)
-    uploaded_mri = st.file_uploader("Upload MRI (.nii / .nii.gz)", type=["nii", "nii.gz"])
-    
-    run_button = st.form_submit_button("🔍 Run AI Analysis")
+    col1, col2 = st.columns(2)
+
+    with col1:
+        patient_name = st.text_input("Patient Name")
+        patient_id = st.text_input("Patient ID")
+
+    with col2:
+        age = st.number_input("Age", min_value=1, max_value=120, step=1)
+        scan_type = st.selectbox("Scan Type", ["MRI - Liver (T1 & T2)"])
+
+    st.subheader("Upload MRI Scans (Both Required)")
+    t1_file = st.file_uploader("Upload T1 MRI (.nii or .nii.gz)", type=["nii", "nii.gz"])
+    t2_file = st.file_uploader("Upload T2 MRI (.nii or .nii.gz)", type=["nii", "nii.gz"])
+
+    run = st.form_submit_button("🔍 Run AI Analysis")
+
 
 # ---------------------- PROCESSING ----------------------
-if run_button and uploaded_mri:
-    
-    st.toast("Processing MRI volume…")
-    mri = nib.load(uploaded_mri)
-    volume = np.array(mri.get_fdata())
+if run:
+
+    # Validate Inputs
+    if not t1_file or not t2_file or patient_name.strip() == "" or patient_id.strip() == "":
+        st.error("❌ Please fill all fields and upload both scans.")
+        st.stop()
+
+    st.info("⏳ Processing MRI scans... Please wait.")
+
+    def load_mri(uploaded):
+        return nib.load(BytesIO(uploaded.read())).get_fdata()
+
+    try:
+        t1_volume = load_mri(t1_file)
+        t2_volume = load_mri(t2_file)
+    except:
+        st.error("❌ Error reading MRI files. Ensure they are valid NIfTI format.")
+        st.stop()
 
     predictions = []
-    total_slices = volume.shape[2]
+    total_slices = min(t1_volume.shape[2], t2_volume.shape[2])
+
     progress = st.progress(0)
 
     for i in range(total_slices):
-        slice_img = volume[:, :, i]
-        if np.mean(slice_img) < 1:
+        slice_pair = (t1_volume[:, :, i] + t2_volume[:, :, i]) / 2  # Fusion
+
+        # Skip blank slices
+        if np.mean(slice_pair) < 1:
             continue
-        
-        features = extract_features(slice_img)
+
+        features = extract_features(slice_pair)
         pred = model.predict([features])[0]
         predictions.append(pred)
-        
+
         progress.progress(int((i / total_slices) * 100))
 
-    st.success("Analysis Completed!")
+    # Slice Stats
+    counts = {k: predictions.count(k) for k in ["Healthy", "Cirrhosis", "Borderline"]}
+    total = sum(counts.values())
 
-    # Count slice-level predictions
-    unique, counts = np.unique(predictions, return_counts=True)
-    result_dict = dict(zip(unique, counts))
-    
-    healthy = result_dict.get("Healthy", 0)
-    cirrhosis = result_dict.get("Cirrhosis", 0)
-    borderline = result_dict.get("Borderline", 0)
-    total = healthy + cirrhosis + borderline
+    # Prediction Rule
+    healthy_ratio = counts["Healthy"] / total
+    cirr_ratio = counts["Cirrhosis"] / total
 
-    # ---------------------- BORDERLINE RULE (#3) ----------------------
-    if total == 0:
-        final_result = "Error"
+    if cirr_ratio > 0.7:
+        final_result = "Cirrhosis"
+        color = "#ff4d4d"
+    elif healthy_ratio > 0.7:
+        final_result = "Healthy"
+        color = "#4dff7a"
     else:
-        h_ratio = healthy / total
-        c_ratio = cirrhosis / total
+        final_result = "Borderline"
+        color = "#ffe066"
 
-        if c_ratio > 0.7:
-            final_result = "Cirrhosis"
-        elif h_ratio > 0.7:
-            final_result = "Healthy"
-        else:
-            final_result = "Borderline"
 
     # ---------------------- DISPLAY RESULT ----------------------
-    if final_result == "Healthy":
-        st.markdown(f"""
-        <div class="result-box" style="border-left: 6px solid #4dff7a;">
-        <h2>🟢 Result: Healthy Liver Pattern</h2>
-        The scan does not show significant features of cirrhosis.
-        </div>
-        """, unsafe_allow_html=True)
+    st.markdown(f"""
+    <div class="result-box" style="border-left-color:{color}">
+    <h2>{'🔴' if final_result=='Cirrhosis' else '🟢' if final_result=='Healthy' else '🟡'} Result: {final_result}</h2>
+    </div>
+    """, unsafe_allow_html=True)
 
-    elif final_result == "Cirrhosis":
-        st.markdown(f"""
-        <div class="result-box" style="border-left: 6px solid #ff4d4d;">
-        <h2>🔴 Result: Cirrhosis Detected</h2>
-        MRI features indicate possible chronic fibrosis of the liver.
-        </div>
-        """, unsafe_allow_html=True)
-
-    else:
-        st.markdown(f"""
-        <div class="result-box" style="border-left: 6px solid #ffe066;">
-        <h2>🟡 Result: Borderline Case</h2>
-        The scan is inconclusive. Further clinical review is advised.
-        </div>
-        """, unsafe_allow_html=True)
-
-    # ---------------------- GRAPH ----------------------
+    # Graph
     st.subheader("📊 Slice Classification Breakdown")
     fig, ax = plt.subplots()
-    ax.bar(result_dict.keys(), result_dict.values(), color=["green","red","yellow"])
+    ax.bar(counts.keys(), counts.values(), color=["green", "red", "yellow"])
     st.pyplot(fig)
+
 
     # ---------------------- PDF REPORT ----------------------
     st.subheader("📄 Download Report")
-    
-    pdf_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf").name
-    c = canvas.Canvas(pdf_file, pagesize=A4)
 
-    c.drawString(50, 800, "AI Liver MRI Screening Report")
-    c.drawString(50, 770, f"Patient Name: {patient_name}")
-    c.drawString(50, 750, f"Patient ID: {patient_id}")
-    c.drawString(50, 730, f"Age: {age}")
-    c.drawString(50, 700, f"Final Result: {final_result}")
-    c.drawString(50, 670, f"Healthy Slices: {healthy}")
-    c.drawString(50, 650, f"Cirrhosis Slices: {cirrhosis}")
-    c.drawString(50, 630, f"Borderline Slices: {borderline}")
-    c.drawString(50, 600, "Disclaimer: This AI tool is for research use only.")
-    
+    pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf").name
+    c = canvas.Canvas(pdf, pagesize=A4)
+
+    c.drawString(50, 800, "Patient MRI Liver Report")
+    c.drawString(50, 780, f"Name: {patient_name}")
+    c.drawString(50, 760, f"ID: {patient_id}")
+    c.drawString(50, 740, f"Age: {age}")
+    c.drawString(50, 720, f"Final Diagnosis: {final_result}")
+    c.drawString(50, 700, f"Slice Summary: {counts}")
+    c.drawString(50, 660, "⚠ AI-based screening. Not a clinical diagnosis.")
     c.save()
 
-    with open(pdf_file, "rb") as f:
-        st.download_button(
-            label="📥 Download Report",
-            data=f,
-            file_name=f"{patient_id}_MRI_Report.pdf",
-            mime="application/pdf"
-        )
-
-else:
-    st.info("Upload MRI and fill details to begin analysis.")
+    with open(pdf, "rb") as f:
+        st.download_button("📥 Download PDF Report", f, f"{patient_id}_MRI_Report.pdf", mime="application/pdf")
 
