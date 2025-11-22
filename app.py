@@ -61,22 +61,14 @@ st.caption("⚠ Research-use only — Not a substitute for clinical diagnosis.")
 # ---------------------- LOAD MODEL ----------------------
 MODEL_PATH = "RandomForest_Cirrhosis.joblib"
 model = joblib.load(MODEL_PATH)
-
-# how many features the model expects
 MODEL_N_FEATURES = getattr(model, "n_features_in_", None)
 
 # ---------------------- HELPER: LOAD NIFTI FROM UPLOAD ----------------------
 def load_nifti_from_upload(uploaded_file):
-    """
-    Save uploaded file to a temporary path and load with nibabel.
-    """
     if uploaded_file is None:
         return None
 
-    if uploaded_file.name.endswith(".nii.gz"):
-        suffix = ".nii.gz"
-    else:
-        suffix = ".nii"
+    suffix = ".nii.gz" if uploaded_file.name.endswith(".nii.gz") else ".nii"
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(uploaded_file.getbuffer())
@@ -94,7 +86,6 @@ def load_nifti_from_upload(uploaded_file):
 
 # ---------------------- FEATURE EXTRACTION ----------------------
 def extract_features(slice_img):
-    # Handle completely flat slices safely
     max_val = np.max(slice_img)
     if max_val <= 0:
         return [0.0, 0.0, 0.0, 0.0]
@@ -117,40 +108,46 @@ def extract_features(slice_img):
     return feats
 
 def prepare_features_for_model(feats):
-    """
-    Make feature vector compatible with the trained RF model:
-    - replace nan/inf with 0
-    - pad or trim to MODEL_N_FEATURES
-    """
     arr = np.array(feats, dtype=float)
     arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
 
     if MODEL_N_FEATURES is None:
-        # model doesn't expose n_features_in_ (very rare) – just use as is
         return arr
 
     n_current = arr.shape[0]
-
     if n_current < MODEL_N_FEATURES:
-        # pad with zeros
         pad = np.zeros(MODEL_N_FEATURES - n_current, dtype=float)
         arr = np.concatenate([arr, pad])
     elif n_current > MODEL_N_FEATURES:
-        # trim extra values
         arr = arr[:MODEL_N_FEATURES]
 
     return arr
+
+def normalize_label(pred):
+    """
+    Convert whatever the RF outputs into standardized labels:
+    'Healthy', 'Cirrhosis', 'Borderline'
+    """
+    s = str(pred).strip().lower()
+
+    if "cirr" in s:
+        return "Cirrhosis"
+    if "heal" in s or "normal" in s or "control" in s:
+        return "Healthy"
+    if "border" in s or "uncertain" in s or "suspect" in s:
+        return "Borderline"
+
+    # fallback: treat unknown as Borderline (uncertain)
+    return "Borderline"
 
 # ---------------------- PATIENT FORM ----------------------
 with st.form("patient_form"):
     st.subheader("👤 Patient Details")
 
     col1, col2 = st.columns(2)
-
     with col1:
         patient_name = st.text_input("Enter your name")
         patient_id = st.text_input("Enter Patient ID")
-
     with col2:
         age = st.text_input("Enter your age")
         scan_type = st.selectbox("Scan Type", ["MRI - Liver (T1 & T2)"])
@@ -163,7 +160,6 @@ with st.form("patient_form"):
 
 # ---------------------- PROCESSING ----------------------
 if run_button:
-    # Basic validation
     if not patient_name.strip() or not patient_id.strip() or not age.strip():
         st.error("❌ Please enter patient name, ID, and age.")
         st.stop()
@@ -174,7 +170,6 @@ if run_button:
 
     st.info("⏳ Processing MRI scans... Please wait.")
 
-    # Load MRI volumes safely
     try:
         t1_volume = load_nifti_from_upload(t1_file)
         t2_volume = load_nifti_from_upload(t2_file)
@@ -186,7 +181,6 @@ if run_button:
         st.error("❌ Could not load MRI data from uploaded files.")
         st.stop()
 
-    # Ensure same number of slices
     total_slices = min(t1_volume.shape[2], t2_volume.shape[2])
 
     predictions = []
@@ -195,7 +189,6 @@ if run_button:
     for i in range(total_slices):
         combined_slice = (t1_volume[:, :, i] + t2_volume[:, :, i]) / 2.0
 
-        # skip only completely zero slices
         if np.all(combined_slice == 0):
             continue
 
@@ -203,19 +196,19 @@ if run_button:
         feats_vec = prepare_features_for_model(feats_raw)
 
         try:
-            pred = model.predict([feats_vec])[0]
+            raw_pred = model.predict([feats_vec])[0]
+            label = normalize_label(raw_pred)
         except Exception:
-            # if some slice still causes trouble, just ignore it
             continue
 
-        predictions.append(pred)
+        predictions.append(label)
         progress.progress(int((i + 1) / total_slices * 100))
 
     if len(predictions) == 0:
         st.error("No valid slices could be classified from the uploaded MRIs.")
         st.stop()
 
-    # Count predictions
+    # ---- Counts based on normalized labels ----
     counts = {
         "Healthy": predictions.count("Healthy"),
         "Cirrhosis": predictions.count("Cirrhosis"),
@@ -223,11 +216,9 @@ if run_button:
     }
     total_used = sum(counts.values())
 
-    # Ratios
     healthy_ratio = counts["Healthy"] / total_used if total_used > 0 else 0
     cirr_ratio = counts["Cirrhosis"] / total_used if total_used > 0 else 0
 
-    # Final decision (borderline rule)
     if cirr_ratio > 0.7:
         final_result = "Cirrhosis"
         color = "#ff4d4d"
@@ -251,10 +242,15 @@ if run_button:
         unsafe_allow_html=True
     )
 
+    # For debugging once: you can uncomment this to see the raw labels
+    # st.write("Raw predictions (unique):", sorted(set(predictions)))
+
     # Slice distribution chart
     st.subheader("📊 Slice Classification Breakdown")
     fig, ax = plt.subplots()
-    ax.bar(counts.keys(), counts.values(), color=["green", "red", "orange"])
+    ax.bar(["Healthy", "Cirrhosis", "Borderline"],
+           [counts["Healthy"], counts["Cirrhosis"], counts["Borderline"]],
+           color=["green", "red", "orange"])
     ax.set_ylabel("Number of Slices")
     ax.set_xlabel("Class")
     st.pyplot(fig)
@@ -273,7 +269,8 @@ if run_button:
     c.drawString(50, 690, f"Final Result: {final_result}")
     c.drawString(
         50, 670,
-        f"Slices - Healthy: {counts['Healthy']}, Cirrhosis: {counts['Cirrhosis']}, Borderline: {counts['Borderline']}"
+        f"Slices - Healthy: {counts['Healthy']}, "
+        f"Cirrhosis: {counts['Cirrhosis']}, Borderline: {counts['Borderline']}"
     )
     c.drawString(50, 640, "Disclaimer: This AI tool is for research/education only,")
     c.drawString(50, 625, "and is NOT a substitute for professional medical diagnosis.")
