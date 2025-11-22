@@ -5,18 +5,46 @@ import matplotlib.pyplot as plt
 import joblib
 import tempfile
 import os
+import re
+import cv2
+from PIL import Image
+
+import torch
+import timm
+from torchvision import transforms
+from skimage.transform import resize
+
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
-from skimage.feature import graycomatrix, graycoprops
 
-# ---------------------- PAGE CONFIG ----------------------
+
+# ---------------------- CONFIG ----------------------
 st.set_page_config(
     page_title="AI Liver MRI Cirrhosis Screening",
     layout="centered",
     page_icon="🧬"
 )
 
-# ---------------------- LIGHT THEME ----------------------
+# Path to RF model (joblib version of your original .pkl)
+MODEL_PATH = "RandomForest_Cirrhosis.joblib"
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Mean-probability thresholds (same as in your notebook)
+LOWER_THRESHOLD = 0.455   # ~45.5%
+UPPER_THRESHOLD = 0.475   # ~47.5%
+SLICE_INFO_THRESHOLD = 0.465   # for slice-wise count (not final decision)
+
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
+
+transform_3ch = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)
+])
+
+
+# ---------------------- THEME ----------------------
 custom_css = """
 <style>
     body {
@@ -54,114 +82,154 @@ custom_css = """
 """
 st.markdown(custom_css, unsafe_allow_html=True)
 
+
 # ---------------------- HEADER ----------------------
 st.markdown("## 🩺 AI Liver MRI Cirrhosis Screening")
 st.caption("⚠ Research-use only — Not a substitute for clinical diagnosis.")
 
-# ---------------------- LOAD MODEL ----------------------
-MODEL_PATH = "RandomForest_Cirrhosis.joblib"
-model = joblib.load(MODEL_PATH)
-MODEL_N_FEATURES = getattr(model, "n_features_in_", None)
 
-# ---------------------- HELPER: LOAD NIFTI FROM UPLOAD ----------------------
+# ---------------------- CACHED MODELS ----------------------
+@st.cache_resource
+def load_vit_model():
+    model = timm.create_model("vit_base_patch16_224", pretrained=True)
+    model.head = torch.nn.Identity()
+    model.to(DEVICE)
+    model.eval()
+    return model
+
+vit_model = load_vit_model()
+
+
+@st.cache_resource
+def load_rf_model():
+    return joblib.load(MODEL_PATH)
+
+rf_model = load_rf_model()
+
+
+# ---------------------- HELPERS (from your notebook, adapted) ----------------------
+def get_orig_name(uploaded_file):
+    """Get original filename from Streamlit UploadedFile."""
+    return os.path.basename(uploaded_file.name)
+
+
+def extract_patient_id(filename):
+    """
+    Heuristic to extract patient ID from filename.
+    e.g. 'patient01_T1.nii.gz' -> 'patient01'
+    """
+    base = os.path.basename(filename).lower()
+    base = re.sub(r"\\.nii(\\.gz)?$", "", base)
+    tokens = re.split(r"[_\\-\\.]", base)
+    filtered = [t for t in tokens if t not in ["t1", "t2", "t1w", "t2w"] and t != ""]
+    if not filtered:
+        return base
+    return "_".join(filtered)
+
+
+def validate_modalities_and_patient(t1_file, t2_file):
+    """
+    - Ensure both files present
+    - Check T1 slot isn't T2 and vice versa (by filename)
+    - Check both look like same patient (simple ID heuristic)
+    """
+    if t1_file is None or t2_file is None:
+        return False, "⚠️ Please upload both **T1** and **T2** MRI volumes."
+
+    t1_name = get_orig_name(t1_file)
+    t2_name = get_orig_name(t2_file)
+
+    t1_lower = t1_name.lower()
+    t2_lower = t2_name.lower()
+
+    # Modality sanity check
+    if "t2" in t1_lower and "t1" not in t1_lower:
+        return False, f"❌ It looks like you uploaded a **T2** file (`{t1_name}`) in the **T1** slot. Please upload the correct T1 file."
+    if "t1" in t2_lower and "t2" not in t2_lower:
+        return False, f"❌ It looks like you uploaded a **T1** file (`{t2_name}`) in the **T2** slot. Please upload the correct T2 file."
+
+    # Same-patient heuristic
+    pid_t1 = extract_patient_id(t1_name)
+    pid_t2 = extract_patient_id(t2_name)
+
+    if pid_t1 != pid_t2:
+        return False, (
+            f"⚠️ The uploaded files seem to belong to **different patients**:\n"
+            f"- T1 file: `{t1_name}` → ID: `{pid_t1}`\n"
+            f"- T2 file: `{t2_name}` → ID: `{pid_t2}`\n\n"
+            "Please ensure T1 and T2 are from the **same patient**."
+        )
+
+    return True, None
+
+
 def load_nifti_from_upload(uploaded_file):
+    """Save uploaded file to temp path and load with nibabel."""
     if uploaded_file is None:
         return None
 
     suffix = ".nii.gz" if uploaded_file.name.endswith(".nii.gz") else ".nii"
-
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(uploaded_file.getbuffer())
         tmp_path = tmp.name
 
-    img = nib.load(tmp_path)
-    data = img.get_fdata()
+    vol = nib.load(tmp_path).get_fdata().astype(np.float32)
 
     try:
         os.remove(tmp_path)
     except OSError:
         pass
 
-    return data
+    return vol
 
-# ---------------------- FEATURE EXTRACTION ----------------------
-def extract_features(slice_img):
-    max_val = np.max(slice_img)
-    if max_val <= 0:
-        return [0.0, 0.0, 0.0, 0.0]
 
-    slice_img = (slice_img / max_val * 255).astype(np.uint8)
-    glcm = graycomatrix(
-        slice_img,
-        distances=[1],
-        angles=[0],
-        levels=256,
-        symmetric=True,
-        normed=True
+def nlm_denoise(slice_img):
+    img = (slice_img * 255).astype(np.uint8)
+    den = cv2.fastNlMeansDenoising(
+        img, None,
+        h=10,
+        templateWindowSize=7,
+        searchWindowSize=21
     )
-    feats = [
-        graycoprops(glcm, 'contrast')[0][0],
-        graycoprops(glcm, 'homogeneity')[0][0],
-        graycoprops(glcm, 'ASM')[0][0],
-        graycoprops(glcm, 'energy')[0][0]
-    ]
-    return feats
-
-def prepare_features_for_model(feats):
-    arr = np.array(feats, dtype=float)
-    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-
-    if MODEL_N_FEATURES is None:
-        return arr
-
-    n_current = arr.shape[0]
-    if n_current < MODEL_N_FEATURES:
-        pad = np.zeros(MODEL_N_FEATURES - n_current, dtype=float)
-        arr = np.concatenate([arr, pad])
-    elif n_current > MODEL_N_FEATURES:
-        arr = arr[:MODEL_N_FEATURES]
-
-    return arr
-
-def normalize_label(pred):
-    """
-    Convert model output into standardized labels:
-    'Healthy', 'Cirrhosis', 'Borderline'
-    
-    Assumed numeric encoding (adjust if your training was different):
-        0 -> Healthy
-        1 -> Cirrhosis
-        2 -> Borderline
-    """
-
-    # 1) Try numeric mapping first (most common for RF)
-    try:
-        val = int(pred)
-        if val == 0:
-            return "Healthy"
-        if val == 1:
-            return "Cirrhosis"
-        if val == 2:
-            return "Borderline"
-        # if you used different encoding, change mapping above
-    except (ValueError, TypeError):
-        pass
-
-    # 2) Fallback to string-based matching
-    s = str(pred).strip().lower()
-
-    if "cirr" in s:
-        return "Cirrhosis"
-    if "heal" in s or "normal" in s or "control" in s:
-        return "Healthy"
-    if "border" in s or "uncertain" in s or "suspect" in s:
-        return "Borderline"
-
-    # 3) If still unknown, treat as Borderline (uncertain)
-    return "Borderline"
+    return den.astype(np.float32) / 255.0
 
 
-# ---------------------- PATIENT FORM ----------------------
+def preprocess_slice(sl):
+    if sl.max() - sl.min() < 1e-6:
+        sln = np.zeros_like(sl)
+    else:
+        sln = (sl - sl.min()) / (sl.max() - sl.min() + 1e-8)
+    sln = nlm_denoise(sln)
+    sln = resize(sln, (224, 224), preserve_range=True).astype(np.float32)
+    return sln
+
+
+def vit_extract_batch(slices, progress_callback=None, start=0.4, end=0.8):
+    batch = []
+    total = len(slices)
+    for idx, s in enumerate(slices):
+        img = (s * 255).astype(np.uint8)
+        s_rgb = np.stack([img] * 3, axis=-1)
+        pil = Image.fromarray(s_rgb)
+        t3 = transform_3ch(pil)
+        batch.append(t3)
+
+        if progress_callback is not None and total > 0:
+            frac = start + (end - start) * (idx + 1) / total
+            progress_callback(frac)
+
+    xb = torch.stack(batch).to(DEVICE)
+    with torch.no_grad():
+        feats = vit_model(xb)
+    return feats.cpu().numpy()
+
+
+def fuse_features(t1_feats, t2_feats):
+    L = min(len(t1_feats), len(t2_feats))
+    return np.concatenate([t1_feats[:L], t2_feats[:L]], axis=1)
+
+
+# ---------------------- PATIENT FORM UI ----------------------
 with st.form("patient_form"):
     st.subheader("👤 Patient Details")
 
@@ -179,8 +247,10 @@ with st.form("patient_form"):
 
     run_button = st.form_submit_button("🔍 Run AI Analysis")
 
-# ---------------------- PROCESSING ----------------------
+
+# ---------------------- MAIN PROCESSING ----------------------
 if run_button:
+    # Basic validation of patient info
     if not patient_name.strip() or not patient_id.strip() or not age.strip():
         st.error("❌ Please enter patient name, ID, and age.")
         st.stop()
@@ -189,85 +259,120 @@ if run_button:
         st.error("❌ Please upload BOTH T1 and T2 MRI files.")
         st.stop()
 
-    st.info("⏳ Processing MRI scans... Please wait.")
+    progress_bar = st.progress(0.0)
+    progress_bar.progress(0.05)
 
+    ok, msg = validate_modalities_and_patient(t1_file, t2_file)
+    if not ok:
+        st.error(msg)
+        st.stop()
+
+    # Load volumes
+    progress_bar.progress(0.15)
     try:
-        t1_volume = load_nifti_from_upload(t1_file)
-        t2_volume = load_nifti_from_upload(t2_file)
+        t1 = load_nifti_from_upload(t1_file)
+        t2 = load_nifti_from_upload(t2_file)
     except Exception as e:
         st.error(f"❌ Error reading MRI files. Ensure they are valid NIfTI images.\n\nDetails: {e}")
         st.stop()
 
-    if t1_volume is None or t2_volume is None:
-        st.error("❌ Could not load MRI data from uploaded files.")
-        st.stop()
+    progress_bar.progress(0.25)
 
-    total_slices = min(t1_volume.shape[2], t2_volume.shape[2])
+    # Preprocess slices
+    n_slices = min(t1.shape[2], t2.shape[2])
+    t1_list, t2_list = [], []
+    for i in range(n_slices):
+        t1_list.append(preprocess_slice(t1[:, :, i]))
+        t2_list.append(preprocess_slice(t2[:, :, i]))
+        if i % max(1, n_slices // 10) == 0:
+            frac = 0.25 + 0.15 * (i + 1) / n_slices
+            progress_bar.progress(frac)
 
-    predictions = []
-    progress = st.progress(0)
+    # ViT feature extraction
+    t1_feats = vit_extract_batch(t1_list, progress_callback=progress_bar.progress, start=0.4, end=0.6)
+    t2_feats = vit_extract_batch(t2_list, progress_callback=progress_bar.progress, start=0.6, end=0.8)
 
-    for i in range(total_slices):
-        combined_slice = (t1_volume[:, :, i] + t2_volume[:, :, i]) / 2.0
+    progress_bar.progress(0.85)
 
-        if np.all(combined_slice == 0):
-            continue
+    # Fuse features and run RF
+    fused = fuse_features(t1_feats, t2_feats)
+    probs = rf_model.predict_proba(fused)[:, 1]  # prob of cirrhosis per slice
 
-        feats_raw = extract_features(combined_slice)
-        feats_vec = prepare_features_for_model(feats_raw)
+    final_prob = probs.mean()
+    num_slices = len(probs)
 
-        try:
-            raw_pred = model.predict([feats_vec])[0]
-            label = normalize_label(raw_pred)
-        except Exception:
-            continue
+    slice_cirr_mask = probs >= SLICE_INFO_THRESHOLD
+    slices_cirr = int(slice_cirr_mask.sum())
+    slices_healthy = num_slices - slices_cirr
 
-        predictions.append(label)
-        progress.progress(int((i + 1) / total_slices * 100))
-
-    if len(predictions) == 0:
-        st.error("No valid slices could be classified from the uploaded MRIs.")
-        st.stop()
-
-    # ---- Counts based on normalized labels ----
-    counts = {
-        "Healthy": predictions.count("Healthy"),
-        "Cirrhosis": predictions.count("Cirrhosis"),
-        "Borderline": predictions.count("Borderline")
-    }
-    total_used = sum(counts.values())
-
-    healthy_ratio = counts["Healthy"] / total_used if total_used > 0 else 0
-    cirr_ratio = counts["Cirrhosis"] / total_used if total_used > 0 else 0
-
-    if cirr_ratio > 0.7:
-        final_result = "Cirrhosis"
-        color = "#ff4d4d"
-        icon = "🔴"
-    elif healthy_ratio > 0.7:
-        final_result = "Healthy"
+    # --- Decision logic (same as your notebook) ---
+    if final_prob < LOWER_THRESHOLD:
+        final_label = "Healthy"
+        decision_note = (
+            "The AI model's estimated cirrhosis probability is **low** and falls below the "
+            f"predefined threshold of {LOWER_THRESHOLD:.3f}. Within the limitations of this model, "
+            "the liver MRI appears more consistent with a **non-cirrhotic** pattern.\n\n"
+            "However, this is an assistive tool only. Final interpretation should be made by a qualified clinician."
+        )
         color = "#22c55e"
         icon = "🟢"
+    elif final_prob > UPPER_THRESHOLD:
+        final_label = "Cirrhosis"
+        decision_note = (
+            "The AI model's estimated cirrhosis probability is **elevated** and exceeds the "
+            f"predefined threshold of {UPPER_THRESHOLD:.3f}. Within the limitations of this model, "
+            "the liver MRI appears more consistent with a **cirrhotic** pattern.\n\n"
+            "Please correlate with clinical findings, laboratory results, and expert radiological opinion."
+        )
+        color = "#ff4d4d"
+        icon = "🔴"
     else:
-        final_result = "Borderline"
+        final_label = "Borderline / Inconclusive"
+        decision_note = (
+            "The AI model's estimated cirrhosis probability lies within a **borderline range** "
+            f"({LOWER_THRESHOLD:.3f}–{UPPER_THRESHOLD:.3f}). In this zone, the model cannot reliably "
+            "differentiate between cirrhotic and non-cirrhotic liver patterns.\n\n"
+            "👉 **Professional Recommendation:**\n"
+            "- This case should be considered **inconclusive** from the AI perspective.\n"
+            "- Please seek a detailed evaluation by a hepatologist or radiologist.\n"
+            "- Additional investigations (e.g., LFTs, elastography, biopsy, follow-up imaging) "
+            "may be appropriate based on clinical judgment."
+        )
         color = "#facc15"
         icon = "🟡"
 
-    # ---------------------- SHOW RESULT ----------------------
+    progress_bar.progress(1.0)
+
+    # ---------------------- DISPLAY RESULT ----------------------
     st.markdown(
         f"""
         <div class="result-box" style="border-left-color:{color}">
-            <h3>{icon} Result: {final_result}</h3>
+            <h3>{icon} Result: {final_label}</h3>
         </div>
         """,
         unsafe_allow_html=True
     )
 
-    # For debugging once: you can uncomment this to see the raw labels
-    # st.write("Raw predictions (unique):", sorted(set(predictions)))
+    st.markdown(
+        f"""
+**Mean estimated cirrhosis probability:** `{final_prob*100:.2f}%`
 
-    # Slice distribution chart
-    st.subheader("📊 Slice Classification Breakdown")
+- Healthy if *p* < {LOWER_THRESHOLD:.3f}  
+- Borderline / Inconclusive if {LOWER_THRESHOLD:.3f} ≤ *p* ≤ {UPPER_THRESHOLD:.3f}  
+- Cirrhosis if *p* > {UPPER_THRESHOLD:.3f}
+
+{decision_note}
+        """
+    )
+
+    # ---------------------- SLICE BAR CHART ----------------------
+    st.subheader("📊 Slice Classification Breakdown (using slice threshold)")
+    counts = {
+        "Healthy": slices_healthy,
+        "Cirrhosis": slices_cirr,
+        "Borderline": 0
+    }
+
     fig, ax = plt.subplots()
     ax.bar(["Healthy", "Cirrhosis", "Borderline"],
            [counts["Healthy"], counts["Cirrhosis"], counts["Borderline"]],
@@ -287,14 +392,14 @@ if run_button:
     c.drawString(50, 760, f"Patient ID: {patient_id}")
     c.drawString(50, 740, f"Age: {age}")
     c.drawString(50, 720, f"Scan Type: {scan_type}")
-    c.drawString(50, 690, f"Final Result: {final_result}")
+    c.drawString(50, 700, f"Final Result: {final_label}")
+    c.drawString(50, 680, f"Mean cirrhosis probability: {final_prob*100:.2f}%")
     c.drawString(
-        50, 670,
-        f"Slices - Healthy: {counts['Healthy']}, "
-        f"Cirrhosis: {counts['Cirrhosis']}, Borderline: {counts['Borderline']}"
+        50, 660,
+        f"Slices leaning Healthy: {slices_healthy}, Slices leaning Cirrhosis: {slices_cirr}"
     )
-    c.drawString(50, 640, "Disclaimer: This AI tool is for research/education only,")
-    c.drawString(50, 625, "and is NOT a substitute for professional medical diagnosis.")
+    c.drawString(50, 630, "Disclaimer: This AI tool is for research/education only,")
+    c.drawString(50, 615, "and is NOT a substitute for professional medical diagnosis.")
     c.save()
 
     with open(pdf_path, "rb") as f:
@@ -304,5 +409,4 @@ if run_button:
             file_name=f"{patient_id}_MRI_Report.pdf",
             mime="application/pdf"
         )
-
 
