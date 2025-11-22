@@ -1,8 +1,9 @@
-streamlit==1.41.0
-numpy==1.26.4
-nibabel==5.2.1
-matplotlib==3.8.4
-scikit-learn==1.4.2
-scikit-image==0.24.0
-reportlab==4.2.2
-Pillow==10.4.0
+streamlit
+numpy
+nibabel
+matplotlib
+scikit-learn
+scikit-image
+reportlab
+Pillow
+
