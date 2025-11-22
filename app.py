@@ -16,7 +16,7 @@ st.set_page_config(
     page_icon="🧬"
 )
 
-# ---------------------- (OPTIONAL) LIGHT GRADIENT THEME ----------------------
+# ---------------------- LIGHT THEME ----------------------
 custom_css = """
 <style>
     body {
@@ -66,12 +66,10 @@ model = joblib.load(MODEL_PATH)
 def load_nifti_from_upload(uploaded_file):
     """
     Save uploaded file to a temporary path and load with nibabel.
-    This avoids BytesIO / path-type errors.
     """
     if uploaded_file is None:
         return None
 
-    # Decide extension based on name
     if uploaded_file.name.endswith(".nii.gz"):
         suffix = ".nii.gz"
     else:
@@ -93,7 +91,13 @@ def load_nifti_from_upload(uploaded_file):
 
 # ---------------------- FEATURE EXTRACTION ----------------------
 def extract_features(slice_img):
-    slice_img = (slice_img / np.max(slice_img) * 255).astype(np.uint8)
+    # Handle completely flat slices safely
+    max_val = np.max(slice_img)
+    if max_val <= 0:
+        # return dummy features (model will still output something)
+        return [0.0, 0.0, 0.0, 0.0]
+
+    slice_img = (slice_img / max_val * 255).astype(np.uint8)
     glcm = graycomatrix(
         slice_img,
         distances=[1],
@@ -161,10 +165,10 @@ if run_button:
     progress = st.progress(0)
 
     for i in range(total_slices):
-        combined_slice = (t1_volume[:, :, i] + t2_volume[:, :, i]) / 2
+        combined_slice = (t1_volume[:, :, i] + t2_volume[:, :, i]) / 2.0
 
-        # Skip nearly empty slices
-        if np.mean(combined_slice) < 1:
+        # Only skip if slice is literally all zeros
+        if np.all(combined_slice == 0):
             continue
 
         feats = extract_features(combined_slice)
@@ -174,7 +178,7 @@ if run_button:
         progress.progress(int((i + 1) / total_slices * 100))
 
     if len(predictions) == 0:
-        st.error("No valid slices found in the uploaded MRIs.")
+        st.error("No valid slices found in the uploaded MRIs (all slices appear empty).")
         st.stop()
 
     # Count predictions
@@ -186,10 +190,10 @@ if run_button:
     total_used = sum(counts.values())
 
     # Ratios
-    healthy_ratio = counts["Healthy"] / total_used
-    cirr_ratio = counts["Cirrhosis"] / total_used
+    healthy_ratio = counts["Healthy"] / total_used if total_used > 0 else 0
+    cirr_ratio = counts["Cirrhosis"] / total_used if total_used > 0 else 0
 
-    # Final decision (same borderline rule)
+    # Final decision (borderline rule)
     if cirr_ratio > 0.7:
         final_result = "Cirrhosis"
         color = "#ff4d4d"
@@ -233,7 +237,10 @@ if run_button:
     c.drawString(50, 740, f"Age: {age}")
     c.drawString(50, 720, f"Scan Type: {scan_type}")
     c.drawString(50, 690, f"Final Result: {final_result}")
-    c.drawString(50, 670, f"Slices - Healthy: {counts['Healthy']}, Cirrhosis: {counts['Cirrhosis']}, Borderline: {counts['Borderline']}")
+    c.drawString(
+        50, 670,
+        f"Slices - Healthy: {counts['Healthy']}, Cirrhosis: {counts['Cirrhosis']}, Borderline: {counts['Borderline']}"
+    )
     c.drawString(50, 640, "Disclaimer: This AI tool is for research/education only,")
     c.drawString(50, 625, "and is NOT a substitute for professional medical diagnosis.")
     c.save()
