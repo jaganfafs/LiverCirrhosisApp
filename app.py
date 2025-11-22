@@ -125,9 +125,29 @@ def prepare_features_for_model(feats):
 
 def normalize_label(pred):
     """
-    Convert whatever the RF outputs into standardized labels:
+    Convert model output into standardized labels:
     'Healthy', 'Cirrhosis', 'Borderline'
+    
+    Assumed numeric encoding (adjust if your training was different):
+        0 -> Healthy
+        1 -> Cirrhosis
+        2 -> Borderline
     """
+
+    # 1) Try numeric mapping first (most common for RF)
+    try:
+        val = int(pred)
+        if val == 0:
+            return "Healthy"
+        if val == 1:
+            return "Cirrhosis"
+        if val == 2:
+            return "Borderline"
+        # if you used different encoding, change mapping above
+    except (ValueError, TypeError):
+        pass
+
+    # 2) Fallback to string-based matching
     s = str(pred).strip().lower()
 
     if "cirr" in s:
@@ -137,8 +157,9 @@ def normalize_label(pred):
     if "border" in s or "uncertain" in s or "suspect" in s:
         return "Borderline"
 
-    # fallback: treat unknown as Borderline (uncertain)
+    # 3) If still unknown, treat as Borderline (uncertain)
     return "Borderline"
+
 
 # ---------------------- PATIENT FORM ----------------------
 with st.form("patient_form"):
@@ -283,4 +304,5 @@ if run_button:
             file_name=f"{patient_id}_MRI_Report.pdf",
             mime="application/pdf"
         )
+
 
