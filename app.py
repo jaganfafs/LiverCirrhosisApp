@@ -62,6 +62,9 @@ st.caption("⚠ Research-use only — Not a substitute for clinical diagnosis.")
 MODEL_PATH = "RandomForest_Cirrhosis.joblib"
 model = joblib.load(MODEL_PATH)
 
+# how many features the model expects
+MODEL_N_FEATURES = getattr(model, "n_features_in_", None)
+
 # ---------------------- HELPER: LOAD NIFTI FROM UPLOAD ----------------------
 def load_nifti_from_upload(uploaded_file):
     """
@@ -94,7 +97,6 @@ def extract_features(slice_img):
     # Handle completely flat slices safely
     max_val = np.max(slice_img)
     if max_val <= 0:
-        # return dummy features (model will still output something)
         return [0.0, 0.0, 0.0, 0.0]
 
     slice_img = (slice_img / max_val * 255).astype(np.uint8)
@@ -106,12 +108,38 @@ def extract_features(slice_img):
         symmetric=True,
         normed=True
     )
-    return [
+    feats = [
         graycoprops(glcm, 'contrast')[0][0],
         graycoprops(glcm, 'homogeneity')[0][0],
         graycoprops(glcm, 'ASM')[0][0],
         graycoprops(glcm, 'energy')[0][0]
     ]
+    return feats
+
+def prepare_features_for_model(feats):
+    """
+    Make feature vector compatible with the trained RF model:
+    - replace nan/inf with 0
+    - pad or trim to MODEL_N_FEATURES
+    """
+    arr = np.array(feats, dtype=float)
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
+    if MODEL_N_FEATURES is None:
+        # model doesn't expose n_features_in_ (very rare) – just use as is
+        return arr
+
+    n_current = arr.shape[0]
+
+    if n_current < MODEL_N_FEATURES:
+        # pad with zeros
+        pad = np.zeros(MODEL_N_FEATURES - n_current, dtype=float)
+        arr = np.concatenate([arr, pad])
+    elif n_current > MODEL_N_FEATURES:
+        # trim extra values
+        arr = arr[:MODEL_N_FEATURES]
+
+    return arr
 
 # ---------------------- PATIENT FORM ----------------------
 with st.form("patient_form"):
@@ -167,18 +195,24 @@ if run_button:
     for i in range(total_slices):
         combined_slice = (t1_volume[:, :, i] + t2_volume[:, :, i]) / 2.0
 
-        # Only skip if slice is literally all zeros
+        # skip only completely zero slices
         if np.all(combined_slice == 0):
             continue
 
-        feats = extract_features(combined_slice)
-        pred = model.predict([feats])[0]
-        predictions.append(pred)
+        feats_raw = extract_features(combined_slice)
+        feats_vec = prepare_features_for_model(feats_raw)
 
+        try:
+            pred = model.predict([feats_vec])[0]
+        except Exception:
+            # if some slice still causes trouble, just ignore it
+            continue
+
+        predictions.append(pred)
         progress.progress(int((i + 1) / total_slices * 100))
 
     if len(predictions) == 0:
-        st.error("No valid slices found in the uploaded MRIs (all slices appear empty).")
+        st.error("No valid slices could be classified from the uploaded MRIs.")
         st.stop()
 
     # Count predictions
