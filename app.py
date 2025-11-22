@@ -70,9 +70,11 @@ Upload MRI scans and generate an AI-assisted medical summary.
 """)
 
 # ---------------------- LOAD MODEL ----------------------
-MODEL_PATH = "RandomForest_Cirrhosis.pkl"
-with open(MODEL_PATH, "rb") as f:
-    model = pickle.load(f)
+import joblib
+
+MODEL_PATH = "RandomForest_Cirrhosis.joblib"
+model = joblib.load(MODEL_PATH)
+
 
 # ---------------------- FEATURE EXTRACTION ----------------------
 def extract_features(slice_img):
@@ -202,3 +204,4 @@ if run_button and uploaded_mri:
 
 else:
     st.info("Upload MRI and fill details to begin analysis.")
+
