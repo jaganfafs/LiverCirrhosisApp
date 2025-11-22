@@ -4,7 +4,11 @@ nibabel
 matplotlib
 scikit-learn
 scikit-image
-reportlab
-Pillow
 joblib
+Pillow
+timm
+torch
+torchvision
+opencv-python-headless
+reportlab
 
