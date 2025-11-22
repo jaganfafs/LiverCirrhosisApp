@@ -30,10 +30,11 @@ MODEL_PATH = "RandomForest_Cirrhosis.joblib"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Mean-probability thresholds (same as in your notebook)
-LOWER_THRESHOLD = 0.455   # ~45.5%
-UPPER_THRESHOLD = 0.475   # ~47.5%
-SLICE_INFO_THRESHOLD = 0.465   # for slice-wise count (not final decision)
+# UPDATED: Mean-probability thresholds (borderline band 46.5–47.5%)
+LOWER_THRESHOLD = 0.465   # 46.5%
+UPPER_THRESHOLD = 0.475   # 47.5%
+# Threshold for slice-wise “cirrhosis-leaning” info (unchanged)
+SLICE_INFO_THRESHOLD = 0.465
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
@@ -107,17 +108,79 @@ def load_rf_model():
 rf_model = load_rf_model()
 
 
-# ---------------------- HELPERS (from your notebook, adapted) ----------------------
+# ---------------------- CONDITION-SPECIFIC TEXT ----------------------
+def get_condition_recommendation(final_label: str) -> str:
+    """
+    Detailed, condition-specific explanation & suggested clinical pathway.
+    This is educational text, not a prescription.
+    """
+    if "Cirrhosis" in final_label:
+        return (
+            "Clinical summary:\n"
+            "The MRI pattern and AI-derived cirrhosis probability suggest a liver that is "
+            "radiologically consistent with chronic liver disease and architectural remodelling.\n\n"
+            "Immediate next steps (for the treating team):\n"
+            "• Refer the patient to a hepatology or gastroenterology specialist.\n"
+            "• Correlate with liver function tests (AST, ALT, ALP, GGT, bilirubin, INR, albumin) and viral / autoimmune workup.\n"
+            "• Assess for complications: portal hypertension, varices, ascites, hepatic encephalopathy.\n"
+            "• Consider ultrasound with Doppler, transient elastography (FibroScan), or contrast-enhanced CT/MRI if not already done.\n\n"
+            "Lifestyle and dietary recommendations (to be reinforced by the clinician):\n"
+            "• Strict avoidance of alcohol and over-the-counter hepatotoxic drugs (e.g., excessive paracetamol).\n"
+            "• Maintain adequate protein intake as advised by the dietitian, with salt restriction in patients with edema or ascites.\n"
+            "• Vaccination status should be reviewed (hepatitis A/B, pneumococcal, influenza) as per guidelines.\n\n"
+            "Medical management (for physician consideration only):\n"
+            "• Non-selective beta blockers may be considered for primary prophylaxis of variceal bleeding when indicated.\n"
+            "• Diuretics and paracentesis protocols are used for tense ascites as per standard practice.\n"
+            "• Etiology-specific treatments (antiviral therapy for viral hepatitis, abstinence and nutritional therapy for alcohol-related disease, etc.) "
+            "should be optimized.\n\n"
+            "Long-term follow-up:\n"
+            "• Regular surveillance for hepatocellular carcinoma (e.g., ultrasound ± AFP every 6 months) in appropriate patients.\n"
+            "• Periodic reassessment of MELD/Child–Pugh scores to decide timing of transplant referral where indicated.\n"
+            "⚠ The above is a generic clinical roadmap; the patient must not self-medicate and all decisions must be taken by a qualified specialist."
+        )
+
+    if "Healthy" in final_label:
+        return (
+            "Clinical summary:\n"
+            "Within the limits of this MRI-based AI model, there is no strong radiological evidence "
+            "to suggest established hepatic cirrhosis.\n\n"
+            "Suggested advice (to be tailored by the clinician):\n"
+            "• Reassure the patient that the liver morphology appears broadly preserved on this study.\n"
+            "• Encourage maintenance of a liver-friendly lifestyle: avoidance of excessive alcohol, cautious use of medications, "
+            "and weight control in patients with metabolic risk factors.\n"
+            "• If there are risk factors such as chronic viral hepatitis, NAFLD, or significant family history, "
+            "periodic clinical and laboratory follow-up is still recommended.\n"
+            "• Routine health checks (liver function tests, metabolic profile) may be scheduled according to local guidelines.\n\n"
+            "When to consider further evaluation despite a ‘Healthy’ pattern:\n"
+            "• Persistent or unexplained symptoms (jaundice, abdominal distension, easy bruising, pruritus, weight loss).\n"
+            "• Strong clinical suspicion from history/examination that is discordant with imaging.\n"
+            "In such scenarios, additional imaging, elastography, or specialist review is appropriate."
+        )
+
+    # Borderline / inconclusive result
+    return (
+        "Clinical summary:\n"
+        "The AI-derived cirrhosis probability lies in a borderline zone where the model cannot reliably "
+        "separate cirrhotic from non-cirrhotic patterns. The imaging findings may be subtle, early, or confounded by artefacts.\n\n"
+        "Recommended clinical approach:\n"
+        "• Treat this case as **inconclusive** from an AI standpoint; do not label as definitely healthy or cirrhotic based solely on this report.\n"
+        "• Correlate carefully with symptoms (fatigue, abdominal discomfort, jaundice), examination findings (hepatomegaly, splenomegaly, ascites), "
+        "and laboratory data.\n"
+        "• Consider repeating imaging with optimized sequences or performing adjunct tests such as elastography or contrast-enhanced MRI/CT.\n"
+        "• Where clinical suspicion is high, early referral to a hepatologist is advisable even if imaging is borderline.\n\n"
+        "Patient counselling points:\n"
+        "• Explain that the AI tool is signalling uncertainty, not a definitive diagnosis.\n"
+        "• Emphasize the importance of follow-up visits, adherence to investigations, and avoidance of liver toxins (alcohol, unnecessary medicines).\n"
+        "• Any treatment decisions must be taken only after full clinical evaluation by the treating physician."
+    )
+
+
+# ---------------------- HELPERS FROM ORIGINAL NOTEBOOK ----------------------
 def get_orig_name(uploaded_file):
-    """Get original filename from Streamlit UploadedFile."""
     return os.path.basename(uploaded_file.name)
 
 
 def extract_patient_id(filename):
-    """
-    Heuristic to extract patient ID from filename.
-    e.g. 'patient01_T1.nii.gz' -> 'patient01'
-    """
     base = os.path.basename(filename).lower()
     base = re.sub(r"\\.nii(\\.gz)?$", "", base)
     tokens = re.split(r"[_\\-\\.]", base)
@@ -128,11 +191,6 @@ def extract_patient_id(filename):
 
 
 def validate_modalities_and_patient(t1_file, t2_file):
-    """
-    - Ensure both files present
-    - Check T1 slot isn't T2 and vice versa (by filename)
-    - Check both look like same patient (simple ID heuristic)
-    """
     if t1_file is None or t2_file is None:
         return False, "⚠️ Please upload both **T1** and **T2** MRI volumes."
 
@@ -142,13 +200,11 @@ def validate_modalities_and_patient(t1_file, t2_file):
     t1_lower = t1_name.lower()
     t2_lower = t2_name.lower()
 
-    # Modality sanity check
     if "t2" in t1_lower and "t1" not in t1_lower:
         return False, f"❌ It looks like you uploaded a **T2** file (`{t1_name}`) in the **T1** slot. Please upload the correct T1 file."
     if "t1" in t2_lower and "t2" not in t2_lower:
         return False, f"❌ It looks like you uploaded a **T1** file (`{t2_name}`) in the **T2** slot. Please upload the correct T2 file."
 
-    # Same-patient heuristic
     pid_t1 = extract_patient_id(t1_name)
     pid_t2 = extract_patient_id(t2_name)
 
@@ -164,7 +220,6 @@ def validate_modalities_and_patient(t1_file, t2_file):
 
 
 def load_nifti_from_upload(uploaded_file):
-    """Save uploaded file to temp path and load with nibabel."""
     if uploaded_file is None:
         return None
 
@@ -250,7 +305,6 @@ with st.form("patient_form"):
 
 # ---------------------- MAIN PROCESSING ----------------------
 if run_button:
-    # Basic validation of patient info
     if not patient_name.strip() or not patient_id.strip() or not age.strip():
         st.error("❌ Please enter patient name, ID, and age.")
         st.stop()
@@ -267,7 +321,6 @@ if run_button:
         st.error(msg)
         st.stop()
 
-    # Load volumes
     progress_bar.progress(0.15)
     try:
         t1 = load_nifti_from_upload(t1_file)
@@ -278,7 +331,6 @@ if run_button:
 
     progress_bar.progress(0.25)
 
-    # Preprocess slices
     n_slices = min(t1.shape[2], t2.shape[2])
     t1_list, t2_list = [], []
     for i in range(n_slices):
@@ -288,15 +340,13 @@ if run_button:
             frac = 0.25 + 0.15 * (i + 1) / n_slices
             progress_bar.progress(frac)
 
-    # ViT feature extraction
     t1_feats = vit_extract_batch(t1_list, progress_callback=progress_bar.progress, start=0.4, end=0.6)
     t2_feats = vit_extract_batch(t2_list, progress_callback=progress_bar.progress, start=0.6, end=0.8)
 
     progress_bar.progress(0.85)
 
-    # Fuse features and run RF
     fused = fuse_features(t1_feats, t2_feats)
-    probs = rf_model.predict_proba(fused)[:, 1]  # prob of cirrhosis per slice
+    probs = rf_model.predict_proba(fused)[:, 1]
 
     final_prob = probs.mean()
     num_slices = len(probs)
@@ -305,43 +355,47 @@ if run_button:
     slices_cirr = int(slice_cirr_mask.sum())
     slices_healthy = num_slices - slices_cirr
 
-    # --- Decision logic (same as your notebook) ---
+    # -------- DECISION WITH UPDATED THRESHOLDS 0.465–0.475 --------
     if final_prob < LOWER_THRESHOLD:
         final_label = "Healthy"
-        decision_note = (
-            "The AI model's estimated cirrhosis probability is **low** and falls below the "
-            f"predefined threshold of {LOWER_THRESHOLD:.3f}. Within the limitations of this model, "
-            "the liver MRI appears more consistent with a **non-cirrhotic** pattern.\n\n"
-            "However, this is an assistive tool only. Final interpretation should be made by a qualified clinician."
-        )
         color = "#22c55e"
         icon = "🟢"
     elif final_prob > UPPER_THRESHOLD:
         final_label = "Cirrhosis"
-        decision_note = (
-            "The AI model's estimated cirrhosis probability is **elevated** and exceeds the "
-            f"predefined threshold of {UPPER_THRESHOLD:.3f}. Within the limitations of this model, "
-            "the liver MRI appears more consistent with a **cirrhotic** pattern.\n\n"
-            "Please correlate with clinical findings, laboratory results, and expert radiological opinion."
-        )
         color = "#ff4d4d"
         icon = "🔴"
     else:
         final_label = "Borderline / Inconclusive"
-        decision_note = (
-            "The AI model's estimated cirrhosis probability lies within a **borderline range** "
-            f"({LOWER_THRESHOLD:.3f}–{UPPER_THRESHOLD:.3f}). In this zone, the model cannot reliably "
-            "differentiate between cirrhotic and non-cirrhotic liver patterns.\n\n"
-            "👉 **Professional Recommendation:**\n"
-            "- This case should be considered **inconclusive** from the AI perspective.\n"
-            "- Please seek a detailed evaluation by a hepatologist or radiologist.\n"
-            "- Additional investigations (e.g., LFTs, elastography, biopsy, follow-up imaging) "
-            "may be appropriate based on clinical judgment."
-        )
         color = "#facc15"
         icon = "🟡"
 
     progress_bar.progress(1.0)
+
+    # Text explaining thresholds & summary (still using thresholds in explanations)
+    if final_label == "Healthy":
+        decision_note = (
+            "The AI model's estimated cirrhosis probability is **low** and falls below the "
+            f"updated threshold of {LOWER_THRESHOLD:.3f} (46.5%). Within the limitations of this model, "
+            "the liver MRI appears more consistent with a **non-cirrhotic** pattern.\n\n"
+            "This is an assistive tool only; final interpretation must be made by a qualified clinician."
+        )
+    elif final_label == "Cirrhosis":
+        decision_note = (
+            "The AI model's estimated cirrhosis probability is **elevated** and exceeds the "
+            f"upper threshold of {UPPER_THRESHOLD:.3f} (47.5%). Within the limitations of this model, "
+            "the liver MRI appears more consistent with a **cirrhotic** pattern.\n\n"
+            "Please correlate with clinical findings, laboratory results, and expert radiological opinion."
+        )
+    else:
+        decision_note = (
+            "The AI model's estimated cirrhosis probability lies within a **borderline range** "
+            f"({LOWER_THRESHOLD:.3f}–{UPPER_THRESHOLD:.3f}, i.e. 46.5–47.5%). In this zone, the model cannot reliably "
+            "differentiate between cirrhotic and non-cirrhotic liver patterns.\n\n"
+            "The case should be considered **inconclusive** from the AI perspective and requires careful clinical correlation."
+        )
+
+    # Condition-specific recommendation text
+    recommendation_text = get_condition_recommendation(final_label)
 
     # ---------------------- DISPLAY RESULT ----------------------
     st.markdown(
@@ -357,16 +411,19 @@ if run_button:
         f"""
 **Mean estimated cirrhosis probability:** `{final_prob*100:.2f}%`
 
-- Healthy if *p* < {LOWER_THRESHOLD:.3f}  
-- Borderline / Inconclusive if {LOWER_THRESHOLD:.3f} ≤ *p* ≤ {UPPER_THRESHOLD:.3f}  
-- Cirrhosis if *p* > {UPPER_THRESHOLD:.3f}
+- **Healthy** if *p* < {LOWER_THRESHOLD:.3f} (46.5%)  
+- **Borderline / Inconclusive** if {LOWER_THRESHOLD:.3f} ≤ *p* ≤ {UPPER_THRESHOLD:.3f} (46.5–47.5%)  
+- **Cirrhosis** if *p* > {UPPER_THRESHOLD:.3f} (47.5%)
 
 {decision_note}
         """
     )
 
+    st.markdown("### 🩺 Condition-specific clinical summary")
+    st.markdown(recommendation_text.replace("\n", "  \n"))
+
     # ---------------------- SLICE BAR CHART ----------------------
-    st.subheader("📊 Slice Classification Breakdown (using slice threshold)")
+    st.subheader("📊 Slice Classification Breakdown (using slice probability threshold)")
     counts = {
         "Healthy": slices_healthy,
         "Cirrhosis": slices_cirr,
@@ -389,17 +446,25 @@ if run_button:
 
     c.drawString(50, 800, "AI Liver MRI Screening Report")
     c.drawString(50, 780, f"Patient Name: {patient_name}")
-    c.drawString(50, 760, f"Patient ID: {patient_id}")
-    c.drawString(50, 740, f"Age: {age}")
-    c.drawString(50, 720, f"Scan Type: {scan_type}")
-    c.drawString(50, 700, f"Final Result: {final_label}")
-    c.drawString(50, 680, f"Mean cirrhosis probability: {final_prob*100:.2f}%")
+    c.drawString(50, 765, f"Patient ID: {patient_id}")
+    c.drawString(50, 750, f"Age: {age}")
+    c.drawString(50, 735, f"Scan Type: {scan_type}")
+    c.drawString(50, 715, f"Final AI Result: {final_label}")
+    c.drawString(50, 700, f"Mean cirrhosis probability: {final_prob*100:.2f}%")
     c.drawString(
-        50, 660,
+        50, 685,
         f"Slices leaning Healthy: {slices_healthy}, Slices leaning Cirrhosis: {slices_cirr}"
     )
-    c.drawString(50, 630, "Disclaimer: This AI tool is for research/education only,")
-    c.drawString(50, 615, "and is NOT a substitute for professional medical diagnosis.")
+
+    # Write condition-specific recommendation into PDF
+    text_obj = c.beginText(50, 660)
+    for line in recommendation_text.split("\n"):
+        text_obj.textLine(line)
+    c.drawText(text_obj)
+
+    c.drawString(50, 80, "Disclaimer: Research / educational use only.")
+    c.drawString(50, 65, "Not a substitute for professional medical diagnosis or treatment.")
+
     c.save()
 
     with open(pdf_path, "rb") as f:
