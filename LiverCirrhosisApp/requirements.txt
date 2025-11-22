@@ -1,9 +1,0 @@
-streamlit
-numpy
-nibabel
-matplotlib
-scikit-learn
-scikit-image
-reportlab
-Pillow
-
